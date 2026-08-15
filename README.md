@@ -7,7 +7,7 @@
 
 **Version control for AI agent behavior.** Git tells you what changed in your prompt — ctxwitch tells you what the change will *do*: semantic diffs across 12 behavioral dimensions, eval gates, and Context PRs for prompts, RAG configs, tool definitions, and guardrails.
 
-![witch tour demo — a prompt edit scored as a behavioral change across 12 dimensions](docs/demo.gif)
+![witch tour demo — a prompt edit scored as a behavioral change across 12 dimensions](https://raw.githubusercontent.com/ctxwitch/ctxwitch/main/docs/demo.gif)
 
 ## Try it in 3 minutes
 
