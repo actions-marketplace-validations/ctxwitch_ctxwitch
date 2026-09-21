@@ -10,11 +10,203 @@ surface at two git revisions and diff *those*, not the raw text.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ctxwitch.extract.ast_utils import SymbolResolver, call_name
-from ctxwitch.extract.base import BehavioralSnapshot, get_adapters
+from ctxwitch.extract.base import BehavioralSnapshot, ToolSpec, get_adapters
+
+
+_MARKDOWN_EXTS = (".md", ".markdown", ".mdx", ".txt")
+_CONFIG_EXTS = (".yaml", ".yml", ".json")
+
+
+def _file_kind(source_file: str) -> str:
+    """Classify a file so non-Python agent config isn't fed to the AST parser.
+
+    Real agents keep their behavioral surface in more than Python: system
+    prompts as ``.md``/``.txt``, config as ``.yaml``/``.json``. Route those to
+    dedicated readers instead of crashing ``ast.parse`` on markdown.
+    """
+    s = (source_file or "").lower()
+    name = Path(s).name
+    if s.endswith(_MARKDOWN_EXTS):
+        return "markdown"
+    if s.endswith(_CONFIG_EXTS):
+        return "config"
+    if s.endswith(".py") or "." not in name:
+        # .py, or extensionless / "<string>" (back-compat for string callers)
+        return "python"
+    return "other"
+
+
+def _prompt_file_snapshot(source: str, source_file: str) -> BehavioralSnapshot:
+    """A standalone prompt file (.md/.txt): the whole file *is* the system prompt."""
+    return BehavioralSnapshot(
+        name=Path(source_file).stem or "prompt",
+        system_prompt=(source or "").strip(),
+        source_framework="prompt-file",
+        source_file=source_file,
+    )
+
+
+def _config_file_snapshot(source: str, source_file: str) -> Optional[BehavioralSnapshot]:
+    """A config file (.yaml/.json): best-effort map of common keys to the surface."""
+    name = Path(source_file).stem or "config"
+    if not (source or "").strip():
+        return BehavioralSnapshot(name=name, source_framework="config-file", source_file=source_file)
+    try:
+        if source_file.lower().endswith(".json"):
+            import json as _json
+            data = _json.loads(source)
+        else:
+            import yaml as _yaml
+            data = _yaml.safe_load(source)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    comp = data.get("components") if isinstance(data.get("components"), dict) else data
+
+    def _pick(d, *keys):
+        for k in keys:
+            v = d.get(k) if isinstance(d, dict) else None
+            if v not in (None, ""):
+                return v
+        return None
+
+    sp = _pick(comp, "system_prompt", "system", "system_message", "instruction",
+               "instructions", "prompt") or ""
+    sp = sp if isinstance(sp, str) else str(sp)
+    model = _pick(comp, "model", "model_name", "llm") or ""
+    model = model if isinstance(model, str) else str(model)
+    temp = _pick(comp, "temperature")
+    try:
+        temp = float(temp) if temp is not None else None
+    except (TypeError, ValueError):
+        temp = None
+    maxt = _pick(comp, "max_tokens", "maxTokens")
+    try:
+        maxt = int(maxt) if maxt is not None else None
+    except (TypeError, ValueError):
+        maxt = None
+
+    tools: List[ToolSpec] = []
+    raw_tools = _pick(comp, "tools", "tool_definitions") or []
+    if isinstance(raw_tools, list):
+        for t in raw_tools:
+            if isinstance(t, str):
+                tools.append(ToolSpec(name=t))
+            elif isinstance(t, dict) and t.get("name"):
+                tools.append(ToolSpec(
+                    name=str(t["name"]),
+                    description=str(t.get("description", "")),
+                    requires_confirmation=bool(t.get("requires_confirmation", False)),
+                ))
+
+    blocked: List[str] = []
+    g = _pick(comp, "guardrails", "guardrail", "safety")
+    guardrails: Dict[str, Any] = dict(g) if isinstance(g, dict) else {}
+    if isinstance(g, dict) and isinstance(g.get("blocked_topics"), list):
+        blocked = [str(x) for x in g["blocked_topics"]]
+    elif isinstance(comp, dict) and isinstance(comp.get("blocked_topics"), list):
+        blocked = [str(x) for x in comp["blocked_topics"]]
+
+    # RAG / retrieval + memory: whole dicts, so CBIA's rag/memory analyzers can
+    # diff enabled / top_k / chunk_size / source / retention, etc.
+    rag = _pick(comp, "rag", "rag_config", "retrieval", "retriever")
+    rag_config: Dict[str, Any] = dict(rag) if isinstance(rag, dict) else {}
+    mem = _pick(comp, "memory", "memory_config")
+    memory: Dict[str, Any] = dict(mem) if isinstance(mem, dict) else {}
+
+    # sampling params CBIA scores beyond temperature
+    sampling: Dict[str, Any] = {}
+    for key, aliases in (
+        ("top_p", ("top_p", "topP")),
+        ("frequency_penalty", ("frequency_penalty", "frequencyPenalty")),
+        ("presence_penalty", ("presence_penalty", "presencePenalty")),
+    ):
+        val = _pick(comp, *aliases)
+        try:
+            if val is not None:
+                sampling[key] = float(val)
+        except (TypeError, ValueError):
+            pass
+
+    return BehavioralSnapshot(
+        name=name, system_prompt=sp, model=model, temperature=temp, max_tokens=maxt,
+        tools=tools, blocked_topics=blocked, guardrails=guardrails,
+        rag_config=rag_config, memory=memory, sampling=sampling,
+        source_framework="config-file", source_file=source_file,
+    )
+
+
+# A module-level constant whose name looks like a prompt/instruction.
+_PROMPT_NAME = re.compile(
+    r"(?:^|_)(?:system_?prompt|sys_?prompt|prompt|instructions?|"
+    r"system_?message|persona|backstory)(?:_|$)",
+    re.IGNORECASE,
+)
+_MIN_PROMPT_LEN = 40
+
+
+def _const_str(node: ast.AST) -> Optional[str]:
+    """Return the string value of a str constant / simple str concatenation."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _const_str(node.left)
+        right = _const_str(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _python_prompt_module_snapshot(
+    tree: ast.Module, source_file: str
+) -> Optional[BehavioralSnapshot]:
+    """Fallback for Python files that *are* prompt definitions.
+
+    Many agents keep their system prompt in a plain ``prompts.py`` /
+    ``system_prompt.py`` as module-level string constants
+    (``SYSTEM_PROMPT = "..."``) with no framework constructor to match. When no
+    adapter claimed anything, treat those constants as the behavioral surface —
+    the same idea as reading a ``.md`` prompt file, so a change to the prompt is
+    still diffed instead of silently dropped.
+
+    Only fires on substantial, prompt-named string constants, so ordinary code
+    files (which have no such constants) produce nothing and stay a clean miss.
+    """
+    found: List[tuple] = []  # (lineno, name, value)
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or not _PROMPT_NAME.search(target.id):
+            continue
+        value = _const_str(node.value)
+        if value is not None and len(value.strip()) >= _MIN_PROMPT_LEN:
+            found.append((getattr(node, "lineno", 0), target.id, value.strip()))
+
+    if not found:
+        return None
+
+    found.sort(key=lambda t: t[0])
+    # One constant: use it directly. Several: label and concatenate in source
+    # order so a change to any one of them shows up in the diff.
+    if len(found) == 1:
+        prompt = found[0][2]
+    else:
+        prompt = "\n\n".join(f"# {name}\n{val}" for _, name, val in found)
+
+    return BehavioralSnapshot(
+        name=Path(source_file).stem or "prompt",
+        system_prompt=prompt,
+        source_framework="python-prompt-module",
+        source_file=source_file,
+        source_line=found[0][0],
+    )
 
 
 def extract_snapshots(
@@ -31,7 +223,21 @@ def extract_snapshots(
 
     Returns a list of snapshots, in source order. Empty if no agent found.
     """
-    tree = ast.parse(source, filename=source_file)
+    kind = _file_kind(source_file)
+    if kind == "markdown":
+        return [_prompt_file_snapshot(source, source_file)]
+    if kind == "config":
+        snap = _config_file_snapshot(source, source_file)
+        return [snap] if snap is not None else []
+    if kind == "other":
+        return []
+
+    # kind == "python"
+    try:
+        tree = ast.parse(source, filename=source_file)
+    except SyntaxError:
+        # Not valid Python (partial file, template, non-code) — never crash a scan.
+        return []
     resolver = SymbolResolver(tree, source_file=source_file)
     adapters = get_adapters(framework)
 
@@ -57,6 +263,13 @@ def extract_snapshots(
             except Exception:
                 # A malformed call must never crash a scan of a whole repo.
                 continue
+
+    if not snapshots:
+        # No framework constructor matched. The file may still *be* a prompt
+        # definition (module-level SYSTEM_PROMPT = "..."); read that if present.
+        fallback = _python_prompt_module_snapshot(tree, source_file)
+        if fallback is not None:
+            return [fallback]
 
     snapshots.sort(key=lambda s: s.source_line)
     return snapshots
